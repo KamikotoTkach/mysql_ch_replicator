@@ -236,12 +236,7 @@ class DbReplicatorInitial:
                 break
             target_table_name = self.replicator.get_target_table_name(table_name)
             self.replicator.clickhouse_api.insert(target_table_name, records, table_structure=clickhouse_table_structure)
-            for record in records:
-                record_primary_key = [record[key_idx] for key_idx in primary_key_ids]
-                if max_primary_key is None:
-                    max_primary_key = record_primary_key
-                else:
-                    max_primary_key = max(max_primary_key, record_primary_key)
+            max_primary_key = self.get_last_record_primary_key(records, primary_key_ids)
 
             self.replicator.state.initial_replication_max_primary_key = max_primary_key
             self.save_state_if_required()
@@ -273,6 +268,14 @@ class DbReplicatorInitial:
             f'primary key: {max_primary_key}',
         )
         self.save_state_if_required(force=True)
+
+    @staticmethod
+    def get_last_record_primary_key(records, primary_key_ids):
+        # Records are already ordered by MySQL using the table collation.
+        # Do not use Python max() here: Python string ordering differs from
+        # MySQL collations like utf8mb4_0900_ai_ci and can make initial
+        # replication loop forever on composite string primary keys.
+        return [records[-1][key_idx] for key_idx in primary_key_ids]
 
     def verify_table_structures_after_replication(self):
         """
