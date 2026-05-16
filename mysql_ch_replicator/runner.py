@@ -17,15 +17,19 @@ from . import db_replicator
 logger = getLogger(__name__)
 
 
+def subprocess_prefix():
+    return f'{sys.executable} {sys.argv[0]}'
+
+
 
 class BinlogReplicatorRunner(ProcessRunner):
     def __init__(self, config_file):
-        super().__init__(f'{sys.argv[0]} --config {config_file} binlog_replicator')
+        super().__init__(f'{subprocess_prefix()} --config {config_file} binlog_replicator')
 
 
 class DbReplicatorRunner(ProcessRunner):
     def __init__(self, db_name, config_file, worker_id=None, total_workers=None, initial_only=False, skip_initial_replication=False):
-        cmd = f'{sys.argv[0]} --config {config_file} --db {db_name} db_replicator'
+        cmd = f'{subprocess_prefix()} --config {config_file} --db {db_name} db_replicator'
         
         if worker_id is not None:
             cmd += f' --worker_id={worker_id}'
@@ -44,12 +48,12 @@ class DbReplicatorRunner(ProcessRunner):
 
 class DbOptimizerRunner(ProcessRunner):
     def __init__(self, config_file):
-        super().__init__(f'{sys.argv[0]} --config {config_file} db_optimizer')
+        super().__init__(f'{subprocess_prefix()} --config {config_file} db_optimizer')
 
 
 class RunAllRunner(ProcessRunner):
     def __init__(self, db_name, config_file):
-        super().__init__(f'{sys.argv[0]} --config {config_file} run_all --db {db_name}')
+        super().__init__(f'{subprocess_prefix()} --config {config_file} run_all --db {db_name}')
 
 
 app = FastAPI()
