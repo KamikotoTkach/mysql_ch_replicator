@@ -420,6 +420,13 @@ def test_parse_mysql_table_structure():
     assert structure.table_name == 'user_preferences_portal'
 
 
+def test_boolean_type_conversion():
+    converter = MysqlToClickhouseConverter()
+
+    assert converter.convert_type('bool', '') == 'Bool'
+    assert converter.convert_type('boolean', '') == 'Bool'
+
+
 def test_alter_tokens_split():
     examples = [
         # basic examples from the prompt:

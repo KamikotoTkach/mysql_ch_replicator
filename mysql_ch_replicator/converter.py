@@ -459,7 +459,7 @@ class MysqlToClickhouseConverter:
             return 'Bool'
         if mysql_type == 'bit(1)':
             return 'Bool'
-        if mysql_type == 'bool':
+        if mysql_type in ('bool', 'boolean'):
             return 'Bool'
         if 'smallint' in mysql_type:
             if is_unsigned:
