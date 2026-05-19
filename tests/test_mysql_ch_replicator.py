@@ -427,6 +427,136 @@ def test_boolean_type_conversion():
     assert converter.convert_type('boolean', '') == 'Bool'
 
 
+def test_parse_named_primary_key_constraint():
+    query = """
+    CREATE TABLE `flyway_schema_history` (
+        `installed_rank` INT NOT NULL,
+        `success` BOOL NOT NULL,
+        CONSTRAINT `flyway_schema_history_pk` PRIMARY KEY (`installed_rank`)
+    )
+    """
+
+    converter = MysqlToClickhouseConverter()
+    mysql_structure, ch_structure = converter.parse_create_table_query(query)
+
+    assert mysql_structure.table_name == 'flyway_schema_history'
+    assert mysql_structure.primary_keys == ['installed_rank']
+    assert ch_structure.primary_keys == ['installed_rank']
+
+
+def test_parse_mysql_create_tables_with_indexes_and_constraints():
+    queries = [
+        """
+        CREATE TABLE `account_balances` (
+            `account_id` VARCHAR(16) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `currency` VARCHAR(8) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `balance` BIGINT(19) NOT NULL DEFAULT '0',
+            `version` INT(10) UNSIGNED NOT NULL DEFAULT '1',
+            `updated_at` TIMESTAMP NULL DEFAULT 'CURRENT_TIMESTAMP' ON UPDATE (CURRENT_TIMESTAMP),
+            PRIMARY KEY (`account_id`, `currency`) USING BTREE,
+            INDEX `idx_updated_at` (`updated_at`) USING BTREE,
+            CONSTRAINT `chk_balance_non_negative` CHECK ((`balance` >= 0))
+        )
+        COLLATE='utf8mb4_0900_ai_ci'
+        ENGINE=InnoDB
+        """,
+        """
+        CREATE TABLE `service_operation_log` (
+            `id` BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            `idempotency_key` VARCHAR(128) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `request_id` VARCHAR(64) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `source_id` VARCHAR(64) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `operation_id` BIGINT(19) NULL DEFAULT NULL,
+            `operation_type` VARCHAR(32) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `entity_label` VARCHAR(64) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `normalized_entity_label` VARCHAR(64) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `amount` INT(10) NULL DEFAULT NULL,
+            `currency` VARCHAR(16) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `trace_id` VARCHAR(128) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `status` VARCHAR(32) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `delivery_reference` VARCHAR(128) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `error_code` VARCHAR(64) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `error_message` VARCHAR(512) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `created_at` TIMESTAMP NOT NULL DEFAULT 'CURRENT_TIMESTAMP',
+            `updated_at` TIMESTAMP NOT NULL DEFAULT 'CURRENT_TIMESTAMP' ON UPDATE (CURRENT_TIMESTAMP),
+            `completed_at` TIMESTAMP NULL DEFAULT NULL,
+            PRIMARY KEY (`id`) USING BTREE,
+            UNIQUE INDEX `ux_service_operation_idempotency_key` (`idempotency_key`) USING BTREE,
+            INDEX `ix_service_operation_status_updated_at` (`status`, `updated_at`) USING BTREE,
+            INDEX `ix_service_operation_request_id` (`request_id`) USING BTREE
+        )
+        COLLATE='utf8mb4_0900_ai_ci'
+        ENGINE=InnoDB
+        AUTO_INCREMENT=8
+        """,
+        """
+        CREATE TABLE `ACCOUNT_RECORDS` (
+            `IDENTIFIER` VARCHAR(255) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `NORMALIZED_IDENTIFIER` VARCHAR(255) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `SECRET_HASH` VARCHAR(255) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `SOURCE_ADDRESS` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `SECOND_FACTOR_TOKEN` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `CREATED_AT` BIGINT(19) NULL DEFAULT NULL,
+            `RECORD_ID` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `EXTERNAL_RECORD_ID` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `LAST_SOURCE_ADDRESS` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `LAST_SEEN_AT` BIGINT(19) NULL DEFAULT NULL,
+            `ISSUEDTIME` BIGINT(19) NULL DEFAULT NULL,
+            PRIMARY KEY (`NORMALIZED_IDENTIFIER`) USING BTREE,
+            INDEX `ACCOUNT_RECORDS_EXTERNAL_RECORD_ID_idx` (`EXTERNAL_RECORD_ID`) USING BTREE,
+            INDEX `ACCOUNT_RECORDS_SOURCE_ADDRESS_idx` (`SOURCE_ADDRESS`) USING BTREE
+        )
+        COLLATE='utf8mb4_0900_ai_ci'
+        ENGINE=InnoDB
+        """,
+        """
+        CREATE TABLE `account_groups` (
+            `uuid` VARCHAR(36) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `account_name` VARCHAR(16) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            `primary_group` VARCHAR(36) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+            PRIMARY KEY (`uuid`) USING BTREE,
+            INDEX `account_groups_account_name` (`account_name`) USING BTREE
+        )
+        COLLATE='utf8mb4_0900_ai_ci'
+        ENGINE=InnoDB
+        """,
+        """
+        CREATE TABLE `action_log` (
+            `id` INT(10) NOT NULL AUTO_INCREMENT,
+            `target_id` BINARY(16) NOT NULL DEFAULT '0x',
+            `actor_id` BINARY(16) NOT NULL DEFAULT '0x',
+            `reviewer_id` BINARY(16) NULL DEFAULT NULL,
+            `expires` BIGINT(19) NOT NULL DEFAULT '0',
+            `time` BIGINT(19) NOT NULL DEFAULT '0',
+            `rule` VARCHAR(50) NOT NULL DEFAULT '0' COLLATE 'armscii8_bin',
+            `action_type` VARCHAR(50) NOT NULL DEFAULT '0' COLLATE 'armscii8_bin',
+            `source_flag` TINYINT(1) NOT NULL DEFAULT '0',
+            PRIMARY KEY (`id`) USING BTREE,
+            INDEX `target_id` (`target_id`) USING BTREE,
+            INDEX `actor_id` (`actor_id`) USING BTREE
+        )
+        COLLATE='armscii8_bin'
+        ENGINE=InnoDB
+        AUTO_INCREMENT=2
+        """,
+    ]
+
+    expected_primary_keys = [
+        ['account_id', 'currency'],
+        ['id'],
+        ['NORMALIZED_IDENTIFIER'],
+        ['uuid'],
+        ['id'],
+    ]
+
+    converter = MysqlToClickhouseConverter()
+    for query, primary_keys in zip(queries, expected_primary_keys):
+        mysql_structure, ch_structure = converter.parse_create_table_query(query)
+
+        assert mysql_structure.primary_keys == primary_keys
+        assert ch_structure.primary_keys == primary_keys
+
+
 def test_alter_tokens_split():
     examples = [
         # basic examples from the prompt:

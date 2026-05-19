@@ -1492,27 +1492,39 @@ class MysqlToClickhouseConverter:
                 continue
             prev_line = ''
 
-            if line.lower().startswith('unique key'):
+            line = line.strip()
+            line_lower = line.lower()
+
+            if line_lower.startswith('constraint'):
+                primary_key_match = re.search(r'\bprimary\s+key\b', line, re.IGNORECASE)
+                if primary_key_match:
+                    line = line[primary_key_match.start():]
+                    line_lower = line.lower()
+                else:
+                    continue
+
+            if line_lower.startswith('unique key'):
                 continue
-            if line.lower().startswith('key'):
+            if line_lower.startswith('unique index'):
                 continue
-            if line.lower().startswith('constraint'):
+            if line_lower.startswith('key'):
                 continue
-            if line.lower().startswith('fulltext'):
+            if line_lower.startswith('index'):
                 continue
-            if line.lower().startswith('spatial'):
+            if line_lower.startswith('fulltext'):
+                continue
+            if line_lower.startswith('spatial'):
                 continue
             # Handle unnamed UNIQUE constraints like "UNIQUE (uuid)" or "UNIQUE(uuid)"
             # This must be checked after other unique key checks to avoid false positives
             # We check if "unique" is followed by optional whitespace and then "("
             # This distinguishes constraints from a field named "unique" (which would be "unique VARCHAR(...)")
-            line_lower = line.strip().lower()
             if line_lower.startswith('unique') and len(line_lower) > 6:
                 # Check if next non-space character after "unique" is "("
                 remaining = line_lower[6:].lstrip()
                 if remaining.startswith('('):
                     continue
-            if line.lower().startswith('primary key'):
+            if line_lower.startswith('primary key'):
                 # Define identifier to match column names, handling backticks and unquoted names
                 identifier = (Suppress('`') + Word(alphas + alphanums + '_') + Suppress('`')) | Word(
                     alphas + alphanums + '_')
@@ -1531,7 +1543,6 @@ class MysqlToClickhouseConverter:
 
                 continue
 
-            line = line.strip()
             # print(" === processing line", line)
 
             if line.startswith('`'):
