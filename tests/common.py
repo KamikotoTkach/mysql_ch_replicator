@@ -26,7 +26,7 @@ TEST_TABLE_NAME_3 = 'test_table_3'
 
 class BinlogReplicatorRunner(ProcessRunner):
     def __init__(self, cfg_file=CONFIG_FILE):
-        super().__init__(f'./main.py --config {cfg_file} binlog_replicator')
+        super().__init__(f'python ./main.py --config {cfg_file} binlog_replicator')
 
 
 class DbReplicatorRunner(ProcessRunner):
@@ -34,12 +34,12 @@ class DbReplicatorRunner(ProcessRunner):
         additional_arguments = additional_arguments or ''
         if not additional_arguments.startswith(' '):
             additional_arguments = ' ' + additional_arguments
-        super().__init__(f'./main.py --config {cfg_file} --db {db_name} db_replicator{additional_arguments}')
+        super().__init__(f'python ./main.py --config {cfg_file} --db {db_name} db_replicator{additional_arguments}')
 
 
 class RunAllRunner(ProcessRunner):
     def __init__(self, cfg_file=CONFIG_FILE):
-        super().__init__(f'./main.py --config {cfg_file} run_all')
+        super().__init__(f'python ./main.py --config {cfg_file} run_all')
 
 
 def kill_process(pid, force=False):
