@@ -8,7 +8,10 @@ try:
 except AttributeError:
     pass
 
-from .main import main
+def main():
+    from .main import main as _main
+
+    return _main()
 
 try:
     __version__ = importlib.metadata.version("mysql-ch-replicator")
