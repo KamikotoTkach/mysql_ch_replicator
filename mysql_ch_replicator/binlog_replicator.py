@@ -19,7 +19,7 @@ from .pymysqlreplication.row_event import (
     UpdateRowsEvent,
     WriteRowsEvent,
 )
-from .pymysqlreplication.event import QueryEvent
+from .pymysqlreplication.event import HeartbeatLogEvent, QueryEvent
 
 from .config import Settings, BinlogReplicatorSettings
 from .utils import GracefulKiller
@@ -340,7 +340,8 @@ class State:
 class BinlogReplicator:
     SAVE_UPDATE_INTERVAL = 60
     BINLOG_CLEAN_INTERVAL = 5 * 60
-    READ_LOG_INTERVAL = 0.3
+    SLAVE_HEARTBEAT_INTERVAL = 5
+    MAX_EVENTS_PER_TICK = 1000
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -364,14 +365,28 @@ class BinlogReplicator:
         self.stream = BinLogStreamReader(
             connection_settings=mysql_settings,
             server_id=random.randint(1, 2**32-2),
-            blocking=False,
+            blocking=True,
             resume_stream=True,
             log_pos=log_pos,
             log_file=log_file,
             mysql_timezone=settings.mysql_timezone,
+            slave_heartbeat=BinlogReplicator.SLAVE_HEARTBEAT_INTERVAL,
+            only_events=[
+                DeleteRowsEvent,
+                UpdateRowsEvent,
+                WriteRowsEvent,
+                QueryEvent,
+                HeartbeatLogEvent,
+            ],
         )
         self.last_state_update = 0
         self.last_binlog_clear_time = 0
+
+    def read_stream_event(self):
+        return self.stream.fetchone()
+
+    def is_heartbeat_event(self, event):
+        return isinstance(event, HeartbeatLogEvent)
 
     def clear_old_binlog_if_required(self):
         curr_time = time.time()
@@ -442,7 +457,11 @@ class BinlogReplicator:
                     )
 
                 last_read_count = 0
-                for event in self.stream:
+                while not killer.kill_now:
+                    event = self.read_stream_event()
+                    if event is None:
+                        break
+
                     last_read_count += 1
                     total_processed_events += 1
                     transaction_id = (self.stream.log_file, self.stream.log_pos)
@@ -452,7 +471,10 @@ class BinlogReplicator:
 
                     logger.debug(f'received event {type(event)}, {transaction_id}')
 
-                    if type(event) not in (DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, QueryEvent):
+                    if self.is_heartbeat_event(event):
+                        break
+
+                    if not isinstance(event, (DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, QueryEvent)):
                         continue
 
                     log_event = LogEvent()
@@ -526,14 +548,11 @@ class BinlogReplicator:
 
                     self.data_writer.store_event(log_event)
 
-                    if last_read_count > 1000:
+                    if last_read_count >= BinlogReplicator.MAX_EVENTS_PER_TICK:
                         break
 
                 self.update_state_if_required(last_transaction_id)
                 self.clear_old_binlog_if_required()
-                #print("last read count", last_read_count)
-                if last_read_count < 50:
-                    time.sleep(BinlogReplicator.READ_LOG_INTERVAL)
 
             except OperationalError as e:
                 logger.error(f'operational error {str(e)}', exc_info=True)
