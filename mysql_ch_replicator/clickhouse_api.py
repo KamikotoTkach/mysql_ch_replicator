@@ -1,6 +1,7 @@
 import datetime
 import time
 import re
+import uuid
 import clickhouse_connect
 
 from logging import getLogger
@@ -377,7 +378,7 @@ class ClickhouseApi:
 
         for i in range(0, len(field_values_list), self.erase_batch_size):
             batch = field_values_list[i:i + self.erase_batch_size]
-            batch_field_values = ', '.join(f'({v})' for v in batch)
+            batch_field_values = ', '.join(f'({self._format_delete_key(v)})' for v in batch)
             
             query = DELETE_QUERY.format(**{
                 'db_name': self.database,
@@ -398,6 +399,23 @@ class ClickhouseApi:
             is_insert=False,
             records=total_records,
         )
+
+    def _format_delete_key(self, value):
+        if not isinstance(value, tuple):
+            return self._format_delete_value(value)
+        return ','.join(self._format_delete_value(item) for item in value)
+
+    def _format_delete_value(self, value):
+        if value is None:
+            return 'NULL'
+        if isinstance(value, uuid.UUID):
+            value = str(value)
+        if isinstance(value, bytes):
+            value = value.decode('utf-8')
+        if isinstance(value, str):
+            value = value.replace('\\', '\\\\').replace("'", "\\'")
+            return f"'{value}'"
+        return str(value)
 
     def drop_database(self, db_name):
         on_cluster = self.get_on_cluster_clause()

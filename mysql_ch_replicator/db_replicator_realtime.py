@@ -1,6 +1,7 @@
 import json
 import os.path
 import time
+import uuid
 from logging import getLogger
 from collections import defaultdict
 
@@ -113,12 +114,14 @@ class DbReplicatorRealtime:
     def _get_record_id(self, ch_table_structure, record: list):
         result = []
         for idx in ch_table_structure.primary_key_ids:
+            value = record[idx]
             field_type = ch_table_structure.fields[idx].field_type
-            if field_type == 'String':
-                result.append(f"'{record[idx]}'")
-            else:
-                result.append(record[idx])
-        return ','.join(map(str, result))
+            if value is not None and 'UUID' in field_type and isinstance(value, bytes):
+                value = uuid.UUID(bytes=value)
+            result.append(value)
+        if len(result) == 1:
+            return result[0]
+        return tuple(result)
 
     def handle_insert_event(self, event: LogEvent):
         if self.replicator.config.debug_log_level:
@@ -204,6 +207,7 @@ class DbReplicatorRealtime:
             return
         target_table_name = self.replicator.get_target_table_name(mysql_structure.table_name)
         ch_structure.table_name = target_table_name
+        ch_structure.if_not_exists = True
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, mysql_structure.table_name)
         partition_bys = self.replicator.config.get_partition_bys(self.replicator.database, mysql_structure.table_name)
