@@ -9,6 +9,7 @@ from logging import getLogger
 
 from .config import Settings
 from .mysql_api import MySQLApi
+from .binlog_replicator import RelayRecovery
 from .utils import ProcessRunner, GracefulKiller
 
 from . import db_replicator
@@ -162,6 +163,8 @@ class Runner:
         databases = [db for db in databases if self.config.is_database_matches(db)]
 
         killer = GracefulKiller()
+
+        RelayRecovery(self.config).recover_if_required(databases=databases)
 
         self.binlog_runner = BinlogReplicatorRunner(self.config.settings_file)
         self.binlog_runner.run()

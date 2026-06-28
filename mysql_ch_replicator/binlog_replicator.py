@@ -1,3 +1,4 @@
+import contextlib
 import pickle
 import struct
 import time
@@ -22,6 +23,7 @@ from .pymysqlreplication.row_event import (
 from .pymysqlreplication.event import HeartbeatLogEvent, QueryEvent
 
 from .config import Settings, BinlogReplicatorSettings
+from .mysql_api import MySQLApi
 from .utils import GracefulKiller
 
 
@@ -42,6 +44,205 @@ class LogEvent:
     table_name: str = ''
     records: object = None
     event_type: int = EventType.UNKNOWN.value
+
+
+class TransactionNotFound(Exception):
+    def __init__(self, db_name, transaction_id):
+        self.db_name = db_name
+        self.transaction_id = transaction_id
+        super().__init__('transaction not found', db_name, transaction_id)
+
+
+@dataclass
+class DbReplicatorStateInfo:
+    db_name: str
+    state_path: str
+    last_processed_transaction: tuple
+
+
+def get_binlog_file_num(file_name):
+    return int(file_name.rsplit('.', 1)[1])
+
+
+def compare_transactions(left, right):
+    left_file_num = get_binlog_file_num(left[0])
+    right_file_num = get_binlog_file_num(right[0])
+    if left_file_num != right_file_num:
+        return left_file_num - right_file_num
+    return left[1] - right[1]
+
+
+def min_transaction(transactions):
+    return min(transactions, key=lambda item: (get_binlog_file_num(item[0]), item[1]))
+
+
+def normalize_transaction(transaction_id):
+    if transaction_id is None:
+        return None
+    return tuple(transaction_id)
+
+
+def load_db_replicator_state_data(state_path):
+    try:
+        data = open(state_path, 'rb').read()
+        return pickle.loads(data)
+    except Exception:
+        logger.warning(f'failed to load db_replicator state {state_path}', exc_info=True)
+        return None
+
+
+def load_db_replicator_state_transaction(state_path):
+    data = load_db_replicator_state_data(state_path)
+    if not data:
+        return None
+    return normalize_transaction(data.get('last_processed_transaction'))
+
+
+def get_db_replicator_state_infos(data_dir, databases=None):
+    if not os.path.exists(data_dir):
+        return []
+
+    allowed_databases = set(databases) if databases is not None else None
+    result = []
+    for entry in os.scandir(data_dir):
+        if not entry.is_dir():
+            continue
+        db_name = os.path.basename(entry.path)
+        if allowed_databases is not None and db_name not in allowed_databases:
+            continue
+        state_path = os.path.join(entry.path, 'state.pckl')
+        if not os.path.exists(state_path):
+            continue
+        transaction_id = load_db_replicator_state_transaction(state_path)
+        if transaction_id is None:
+            continue
+        result.append(DbReplicatorStateInfo(
+            db_name=db_name,
+            state_path=state_path,
+            last_processed_transaction=transaction_id,
+        ))
+    return result
+
+
+def get_db_replicator_state_transactions(data_dir, db_name):
+    db_path = os.path.join(data_dir, db_name)
+    if not os.path.exists(db_path):
+        return []
+
+    result = []
+    for file_name in os.listdir(db_path):
+        if file_name == 'state.pckl' or (file_name.startswith('state_worker_') and file_name.endswith('.pckl')):
+            transaction_id = load_db_replicator_state_transaction(os.path.join(db_path, file_name))
+            if transaction_id is not None:
+                result.append(transaction_id)
+    return result
+
+
+def get_binlog_stream_events():
+    return [
+        DeleteRowsEvent,
+        UpdateRowsEvent,
+        WriteRowsEvent,
+        QueryEvent,
+        HeartbeatLogEvent,
+    ]
+
+
+def get_mysql_connection_settings(settings: Settings):
+    mysql_settings = {
+        'host': settings.mysql.host,
+        'port': settings.mysql.port,
+        'user': settings.mysql.user,
+        'passwd': settings.mysql.password,
+        'charset': settings.mysql.charset,
+    }
+    return mysql_settings
+
+
+def create_binlog_stream(settings: Settings, log_file=None, log_pos=None, blocking=True):
+    return BinLogStreamReader(
+        connection_settings=get_mysql_connection_settings(settings),
+        server_id=random.randint(1, 2**32-2),
+        blocking=blocking,
+        resume_stream=True,
+        log_pos=log_pos,
+        log_file=log_file,
+        mysql_timezone=settings.mysql_timezone,
+        slave_heartbeat=BinlogReplicator.SLAVE_HEARTBEAT_INTERVAL if blocking else None,
+        only_events=get_binlog_stream_events(),
+    )
+
+
+def decode_if_bytes(value):
+    if isinstance(value, bytes):
+        return value.decode('utf-8')
+    return value
+
+
+def get_query_event_db_name(query: str) -> str:
+    return BinlogReplicator._try_parse_db_name_from_query(query)
+
+
+def convert_stream_event_to_log_event(settings: Settings, event, transaction_id):
+    if isinstance(event, HeartbeatLogEvent):
+        return None
+
+    if not isinstance(event, (DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, QueryEvent)):
+        return None
+
+    log_event = LogEvent()
+    if hasattr(event, 'table'):
+        log_event.table_name = decode_if_bytes(event.table)
+
+        if not settings.is_table_matches(log_event.table_name):
+            return None
+
+    log_event.db_name = decode_if_bytes(event.schema)
+
+    if isinstance(event, UpdateRowsEvent) or isinstance(event, WriteRowsEvent):
+        log_event.event_type = EventType.ADD_EVENT.value
+
+    if isinstance(event, DeleteRowsEvent):
+        log_event.event_type = EventType.REMOVE_EVENT.value
+
+    if isinstance(event, QueryEvent):
+        log_event.event_type = EventType.QUERY.value
+
+    if log_event.event_type == EventType.UNKNOWN.value:
+        return None
+
+    if log_event.event_type == EventType.QUERY.value:
+        db_name_from_query = get_query_event_db_name(event.query)
+        if db_name_from_query:
+            log_event.db_name = db_name_from_query
+
+    if not settings.is_database_matches(log_event.db_name):
+        return None
+
+    log_event.transaction_id = transaction_id
+
+    if isinstance(event, QueryEvent):
+        log_event.records = event.query
+        return log_event
+
+    log_event.records = []
+    for row in event.rows:
+        if isinstance(event, DeleteRowsEvent):
+            vals = row['values']
+            vals = list(vals.values())
+            log_event.records.append(vals)
+
+        elif isinstance(event, UpdateRowsEvent):
+            vals = row['after_values']
+            vals = list(vals.values())
+            log_event.records.append(vals)
+
+        elif isinstance(event, WriteRowsEvent):
+            vals = row['values']
+            vals = list(vals.values())
+            log_event.records.append(vals)
+
+    return log_event
 
 
 class FileWriter:
@@ -147,6 +348,7 @@ class DataReader:
         file_name = get_file_name_by_num(self.data_dir, self.db_name, file_num)
         file_reader = FileReader(file_name)
         first_event = file_reader.read_next_event()
+        file_reader.close()
         if first_event is None:
             return None
         return first_event.transaction_id
@@ -154,21 +356,28 @@ class DataReader:
     def file_has_transaction(self, file_num, transaction_id) -> bool:
         file_name = get_file_name_by_num(self.data_dir, self.db_name, file_num)
         reader = FileReader(file_name)
-        while True:
-            event = reader.read_next_event()
-            if event is None:
-                break
-            if event.transaction_id == transaction_id:
-                reader.close()
-                return True
-        return False
+        try:
+            while True:
+                event = reader.read_next_event()
+                if event is None:
+                    break
+                if event.transaction_id == transaction_id:
+                    return True
+            return False
+        finally:
+            reader.close()
 
     def get_file_with_transaction(self, existing_file_nums, transaction_id):
+        if not existing_file_nums:
+            raise TransactionNotFound(self.db_name, transaction_id)
+
         matching_file_num = None
         prev_file_num = None
         for file_num in existing_file_nums:
             file_first_transaction = self.get_first_transaction_in_file(file_num)
-            if file_first_transaction > transaction_id:
+            if file_first_transaction is None:
+                continue
+            if compare_transactions(file_first_transaction, transaction_id) > 0:
                 matching_file_num = prev_file_num
                 break
             prev_file_num = file_num
@@ -183,7 +392,7 @@ class DataReader:
             if self.file_has_transaction(file_num, transaction_id):
                 return file_num
 
-        raise Exception('transaction not found', transaction_id)
+        raise TransactionNotFound(self.db_name, transaction_id)
 
     def set_position(self, transaction_id):
         existing_file_nums = get_existing_file_nums(self.data_dir, self.db_name)
@@ -214,9 +423,9 @@ class DataReader:
             if event.transaction_id == transaction_id:
                 logger.info(f'found transaction {transaction_id} inside {file_name}')
                 return
-            if event.transaction_id > transaction_id:
+            if compare_transactions(event.transaction_id, transaction_id) > 0:
                 break
-        raise Exception(f'transaction {transaction_id} not found in {file_name}')
+        raise TransactionNotFound(self.db_name, transaction_id)
 
     def read_next_event(self) -> LogEvent:
         if self.current_file_reader is None:
@@ -285,13 +494,48 @@ class DataWriter:
         new_file_name = os.path.join(self.data_dir, db_name, new_file_name)
         return new_file_name
 
+    def get_oldest_protected_file_num(self, db_name, existing_file_nums):
+        protected_transactions = get_db_replicator_state_transactions(self.data_dir, db_name)
+        if not protected_transactions:
+            return None, True
+
+        reader = DataReader(BinlogReplicatorSettings(data_dir=self.data_dir), db_name)
+        protected_file_nums = []
+        for transaction_id in protected_transactions:
+            try:
+                protected_file_nums.append(reader.get_file_with_transaction(existing_file_nums, transaction_id))
+            except TransactionNotFound:
+                logger.warning(
+                    f'skip old binlog cleanup for {db_name}: '
+                    f'protected transaction {transaction_id} is missing from local relay',
+                )
+                return None, False
+        return min(protected_file_nums), True
+
     def remove_old_files(self, ts_from):
         PRESERVE_FILES_COUNT = 5
 
         subdirs = [f.path for f in os.scandir(self.data_dir) if f.is_dir()]
-        for db_name in subdirs:
-            existing_file_nums = get_existing_file_nums(self.data_dir, db_name)[:-1]
-            for file_num in existing_file_nums[:-PRESERVE_FILES_COUNT]:
+        for db_path in subdirs:
+            db_name = os.path.basename(db_path)
+            existing_file_nums = get_existing_file_nums(self.data_dir, db_name)
+            protected_file_num, can_cleanup = self.get_oldest_protected_file_num(db_name, existing_file_nums)
+            if not can_cleanup:
+                continue
+
+            if len(existing_file_nums) <= PRESERVE_FILES_COUNT + 1:
+                file_nums_to_check = []
+            else:
+                # Preserve the current writer file and several latest closed files.
+                file_nums_to_check = existing_file_nums[:-(PRESERVE_FILES_COUNT + 1)]
+
+            if protected_file_num is not None:
+                file_nums_to_check = [
+                    file_num for file_num in file_nums_to_check
+                    if file_num < protected_file_num
+                ]
+
+            for file_num in file_nums_to_check:
                 file_path = os.path.join(self.data_dir, db_name, f'{file_num}.bin')
                 modify_time = os.path.getmtime(file_path)
                 if modify_time <= ts_from:
@@ -337,6 +581,160 @@ class State:
         os.rename(file_name + '.tmp', file_name)
 
 
+class RelayRecovery:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.data_dir = settings.binlog_replicator.data_dir
+
+    def recover_if_required(self, databases=None):
+        state_infos = get_db_replicator_state_infos(self.data_dir, databases=databases)
+        missing_states = self.get_missing_states(state_infos=state_infos)
+        if not missing_states:
+            logger.info('local relay recovery not required')
+            return False
+
+        databases_to_rebuild = sorted({state.db_name for state in state_infos})
+        start_transaction = min_transaction([state.last_processed_transaction for state in state_infos])
+        start_file = start_transaction[0]
+        logger.warning(
+            f'local relay recovery required for databases {[state.db_name for state in missing_states]}; '
+            f'rebuilding local relay for databases {databases_to_rebuild}, '
+            f'starting from MySQL binlog file {start_file}',
+        )
+
+        self.validate_mysql_binlog_available(start_file)
+        backups = self.backup_bin_files(databases_to_rebuild)
+        data_writer = DataWriter(self.settings.binlog_replicator)
+        final_transaction = None
+        try:
+            final_transaction = self.rebuild_relay(
+                data_writer=data_writer,
+                affected_databases=set(databases_to_rebuild),
+                start_file=start_file,
+            )
+            data_writer.close_all()
+            self.validate_recovered_states(state_infos)
+            self.save_binlog_state(final_transaction)
+        except Exception:
+            data_writer.close_all()
+            self.restore_backups(backups)
+            raise
+
+        logger.warning(
+            f'local relay recovery finished for databases {databases_to_rebuild}, '
+            f'last recovered transaction: {final_transaction}',
+        )
+        return True
+
+    def get_missing_states(self, state_infos):
+        result = []
+        for state_info in state_infos:
+            existing_file_nums = get_existing_file_nums(self.data_dir, state_info.db_name)
+            reader = DataReader(self.settings.binlog_replicator, state_info.db_name)
+            try:
+                reader.get_file_with_transaction(existing_file_nums, state_info.last_processed_transaction)
+            except TransactionNotFound:
+                result.append(state_info)
+        return result
+
+    def validate_mysql_binlog_available(self, start_file):
+        mysql_api = MySQLApi(
+            database=None,
+            mysql_settings=self.settings.mysql,
+            mysql_timezone=self.settings.mysql_timezone,
+        )
+        try:
+            mysql_binlog_files = mysql_api.get_binlog_files()
+        finally:
+            with contextlib.suppress(Exception):
+                mysql_api.close()
+
+        if start_file not in mysql_binlog_files:
+            raise RuntimeError(
+                f'cannot recover local relay from MySQL: required binlog file {start_file} is not available; '
+                f'available files: {mysql_binlog_files}'
+            )
+
+    def backup_bin_files(self, databases):
+        backups = {}
+        timestamp = int(time.time())
+        for db_name in databases:
+            db_path = os.path.join(self.data_dir, db_name)
+            if not os.path.exists(db_path):
+                continue
+            bin_files = [
+                file_name for file_name in os.listdir(db_path)
+                if file_name.endswith('.bin')
+            ]
+            if not bin_files:
+                continue
+
+            backup_dir = os.path.join(db_path, f'recovery_backup_{timestamp}')
+            suffix = 1
+            while os.path.exists(backup_dir):
+                backup_dir = os.path.join(db_path, f'recovery_backup_{timestamp}_{suffix}')
+                suffix += 1
+            os.mkdir(backup_dir)
+
+            backups[db_name] = backup_dir
+            for file_name in bin_files:
+                os.replace(os.path.join(db_path, file_name), os.path.join(backup_dir, file_name))
+        return backups
+
+    def restore_backups(self, backups):
+        for db_name, backup_dir in backups.items():
+            db_path = os.path.join(self.data_dir, db_name)
+            for file_name in os.listdir(db_path):
+                if file_name.endswith('.bin'):
+                    os.remove(os.path.join(db_path, file_name))
+            for file_name in os.listdir(backup_dir):
+                os.replace(os.path.join(backup_dir, file_name), os.path.join(db_path, file_name))
+            with contextlib.suppress(OSError):
+                os.rmdir(backup_dir)
+
+    def rebuild_relay(self, data_writer, affected_databases, start_file):
+        stream = create_binlog_stream(self.settings, log_file=start_file, log_pos=4, blocking=False)
+        final_transaction = (start_file, 4)
+        try:
+            while True:
+                event = stream.fetchone()
+                if event is None:
+                    if stream.log_file is not None and stream.log_pos is not None:
+                        final_transaction = (stream.log_file, stream.log_pos)
+                    break
+
+                if stream.log_file is None or stream.log_pos is None:
+                    continue
+
+                transaction_id = (stream.log_file, stream.log_pos)
+                final_transaction = transaction_id
+                log_event = convert_stream_event_to_log_event(self.settings, event, transaction_id)
+                if log_event is None:
+                    continue
+                if log_event.db_name not in affected_databases:
+                    continue
+                data_writer.store_event(log_event)
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+        return final_transaction
+
+    def validate_recovered_states(self, state_infos):
+        for state_info in state_infos:
+            existing_file_nums = get_existing_file_nums(self.data_dir, state_info.db_name)
+            reader = DataReader(self.settings.binlog_replicator, state_info.db_name)
+            reader.get_file_with_transaction(existing_file_nums, state_info.last_processed_transaction)
+
+    def save_binlog_state(self, final_transaction):
+        if final_transaction is None:
+            return
+        state = State(os.path.join(self.data_dir, 'state.json'))
+        state.prev_last_seen_transaction = final_transaction
+        state.last_seen_transaction = final_transaction
+        state.save()
+
+
 class BinlogReplicator:
     SAVE_UPDATE_INTERVAL = 60
     BINLOG_CLEAN_INTERVAL = 5 * 60
@@ -347,13 +745,6 @@ class BinlogReplicator:
         self.settings = settings
         self.mysql_settings = settings.mysql
         self.replicator_settings = settings.binlog_replicator
-        mysql_settings = {
-            'host': self.mysql_settings.host,
-            'port': self.mysql_settings.port,
-            'user': self.mysql_settings.user,
-            'passwd': self.mysql_settings.password,
-            'charset': self.mysql_settings.charset,
-        }
         self.data_writer = DataWriter(self.replicator_settings)
         self.state = State(os.path.join(self.replicator_settings.data_dir, 'state.json'))
         logger.info(f'state start position: {self.state.prev_last_seen_transaction}')
@@ -362,23 +753,7 @@ class BinlogReplicator:
         if self.state.prev_last_seen_transaction:
             log_file, log_pos = self.state.prev_last_seen_transaction
 
-        self.stream = BinLogStreamReader(
-            connection_settings=mysql_settings,
-            server_id=random.randint(1, 2**32-2),
-            blocking=True,
-            resume_stream=True,
-            log_pos=log_pos,
-            log_file=log_file,
-            mysql_timezone=settings.mysql_timezone,
-            slave_heartbeat=BinlogReplicator.SLAVE_HEARTBEAT_INTERVAL,
-            only_events=[
-                DeleteRowsEvent,
-                UpdateRowsEvent,
-                WriteRowsEvent,
-                QueryEvent,
-                HeartbeatLogEvent,
-            ],
-        )
+        self.stream = create_binlog_stream(settings, log_file=log_file, log_pos=log_pos, blocking=True)
         self.last_state_update = 0
         self.last_binlog_clear_time = 0
 
@@ -387,6 +762,9 @@ class BinlogReplicator:
 
     def is_heartbeat_event(self, event):
         return isinstance(event, HeartbeatLogEvent)
+
+    def convert_stream_event_to_log_event(self, event, transaction_id):
+        return convert_stream_event_to_log_event(self.settings, event, transaction_id)
 
     def clear_old_binlog_if_required(self):
         curr_time = time.time()
@@ -474,67 +852,11 @@ class BinlogReplicator:
                     if self.is_heartbeat_event(event):
                         break
 
-                    if not isinstance(event, (DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, QueryEvent)):
-                        continue
-
-                    log_event = LogEvent()
-                    if hasattr(event, 'table'):
-                        log_event.table_name = event.table
-                        if isinstance(log_event.table_name, bytes):
-                            log_event.table_name = log_event.table_name.decode('utf-8')
-
-                        if not self.settings.is_table_matches(log_event.table_name):
-                            continue
-
-                    log_event.db_name = event.schema
-
-                    if isinstance(log_event.db_name, bytes):
-                        log_event.db_name = log_event.db_name.decode('utf-8')
-
-                    if isinstance(event, UpdateRowsEvent) or isinstance(event, WriteRowsEvent):
-                        log_event.event_type = EventType.ADD_EVENT.value
-
-                    if isinstance(event, DeleteRowsEvent):
-                        log_event.event_type = EventType.REMOVE_EVENT.value
-
-                    if isinstance(event, QueryEvent):
-                        log_event.event_type = EventType.QUERY.value
-
-                    if log_event.event_type == EventType.UNKNOWN.value:
-                        continue
-
-                    if log_event.event_type == EventType.QUERY.value:
-                        db_name_from_query = self._try_parse_db_name_from_query(event.query)
-                        if db_name_from_query:
-                            log_event.db_name = db_name_from_query
-
-                    if not self.settings.is_database_matches(log_event.db_name):
+                    log_event = self.convert_stream_event_to_log_event(event, transaction_id)
+                    if log_event is None:
                         continue
 
                     logger.debug(f'event matched {transaction_id}, {log_event.db_name}, {log_event.table_name}')
-
-                    log_event.transaction_id = transaction_id
-
-                    if isinstance(event, QueryEvent):
-                        log_event.records = event.query
-                    else:
-                        log_event.records = []
-
-                        for row in event.rows:
-                            if isinstance(event, DeleteRowsEvent):
-                                vals = row["values"]
-                                vals = list(vals.values())
-                                log_event.records.append(vals)
-
-                            elif isinstance(event, UpdateRowsEvent):
-                                vals = row["after_values"]
-                                vals = list(vals.values())
-                                log_event.records.append(vals)
-
-                            elif isinstance(event, WriteRowsEvent):
-                                vals = row["values"]
-                                vals = list(vals.values())
-                                log_event.records.append(vals)
 
                     if self.settings.debug_log_level:
                         # records serialization is heavy, only do it with debug log enabled
