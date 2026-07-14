@@ -196,6 +196,12 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     mysql.execute(
         f"ALTER TABLE `{TEST_TABLE_NAME}` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
 
+    # CHECK constraints are MySQL-only metadata and should not block replication.
+    mysql.execute(
+        f"ALTER TABLE `{TEST_TABLE_NAME}` ADD CONSTRAINT chk_c1_non_negative CHECK (c1 IS NULL OR c1 >= 0)")
+    mysql.execute(
+        f"ALTER TABLE `{TEST_TABLE_NAME}` DROP CHECK chk_c1_non_negative")
+
     mysql.execute(
         f"INSERT INTO `{TEST_TABLE_NAME}` (id, c1, c2) VALUES (46, 333, 444)",
         commit=True,

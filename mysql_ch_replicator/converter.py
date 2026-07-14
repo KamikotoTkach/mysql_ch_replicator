@@ -4,6 +4,8 @@ import uuid
 import sqlparse
 import re
 import datetime
+from dataclasses import dataclass
+from enum import Enum
 from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList
 import copy
 
@@ -14,6 +16,25 @@ from .enum import (
     extract_enum_or_set_values
 )
 from .mysql_api import MySQLApi
+
+
+class AlterOperationCategory(Enum):
+    COLUMN_CHANGE = 'column_change'
+    SAFE_NOOP = 'safe_noop'
+    REQUIRES_RESYNC = 'requires_resync'
+    UNKNOWN = 'unknown'
+
+
+@dataclass(frozen=True)
+class AlterOperation:
+    category: AlterOperationCategory
+    action: str
+    tokens: tuple
+    clause: str
+
+
+class UnsupportedAlterOperation(Exception):
+    pass
 
 
 CHARSET_MYSQL_TO_PYTHON = {
@@ -708,11 +729,11 @@ class MysqlToClickhouseConverter:
 
         return db_name, table_name, matches_config
 
-    def convert_alter_query(self, mysql_query, db_name):
+    def parse_alter_query(self, mysql_query, db_name):
         mysql_query = self.__basic_validate_query(mysql_query)
 
         tokens = mysql_query.split()
-        if tokens[0].lower() != 'alter':
+        if len(tokens) < 4 or tokens[0].lower() != 'alter':
             raise Exception('wrong query')
 
         if tokens[1].lower() != 'table':
@@ -721,72 +742,229 @@ class MysqlToClickhouseConverter:
         db_name, table_name, matches_config = self.get_db_and_table_name(tokens[2], db_name)
 
         if not matches_config:
-            return
+            return db_name, table_name, matches_config, []
 
         subqueries = ' '.join(tokens[3:])
         subqueries = split_high_level(subqueries, ',')
+        operations = []
 
         for subquery in subqueries:
             subquery = subquery.strip()
             tokens = subquery.split()
+            if not tokens:
+                raise Exception(f'empty alter operation, query: {mysql_query}')
 
             op_name = tokens[0].lower()
             tokens = tokens[1:]
 
-            if tokens[0].lower() == 'column':
-                tokens = tokens[1:]
+            operations.append(self._classify_alter_operation(op_name, tokens, subquery))
 
-            if op_name == 'add':
-                if tokens[0].lower() in ('constraint', 'index', 'foreign', 'unique', 'key'):
-                    continue
-                # Handle cases where keywords are combined with parentheses: INDEX(col), CONSTRAINT(name), etc.
-                for keyword in ('constraint', 'index', 'foreign', 'unique', 'key'):
-                    if tokens[0].lower().startswith(f'{keyword}('):
-                        break
-                else:
-                    self.__convert_alter_table_add_column(db_name, table_name, tokens)
+        return db_name, table_name, matches_config, operations
+
+    @staticmethod
+    def _starts_with_keyword(token, keywords):
+        token = token.lower()
+        return token in keywords or any(token.startswith(f'{keyword}(') for keyword in keywords)
+
+    def _classify_alter_operation(self, op_name, tokens, subquery):
+        tokens = list(tokens)
+        if '=' in op_name:
+            op_name, inline_value = op_name.split('=', 1)
+            tokens.insert(0, inline_value)
+
+        if op_name in ('add', 'drop', 'modify', 'change') and tokens and tokens[0].lower() == 'column':
+            tokens = tokens[1:]
+
+        if op_name == 'add':
+            if not tokens:
+                return AlterOperation(AlterOperationCategory.UNKNOWN, op_name, tuple(tokens), subquery)
+            first_token = tokens[0].lower()
+            if first_token == 'partition' or first_token.startswith('partition('):
+                return AlterOperation(AlterOperationCategory.REQUIRES_RESYNC, op_name, tuple(tokens), subquery)
+            if first_token == 'primary':
+                return AlterOperation(AlterOperationCategory.SAFE_NOOP, op_name, tuple(tokens), subquery)
+            ignored_keywords = ('constraint', 'index', 'foreign', 'unique', 'key', 'fulltext', 'spatial', 'check')
+            if self._starts_with_keyword(tokens[0], ignored_keywords):
+                return AlterOperation(AlterOperationCategory.SAFE_NOOP, op_name, tuple(tokens), subquery)
+            if first_token.startswith('('):
+                return AlterOperation(AlterOperationCategory.REQUIRES_RESYNC, op_name, tuple(tokens), subquery)
+            return AlterOperation(AlterOperationCategory.COLUMN_CHANGE, 'add_column', tuple(tokens), subquery)
+
+        if op_name == 'drop':
+            if not tokens:
+                return AlterOperation(AlterOperationCategory.UNKNOWN, op_name, tuple(tokens), subquery)
+            first_token = tokens[0].lower()
+            if first_token == 'partition' or first_token.startswith('partition('):
+                return AlterOperation(AlterOperationCategory.REQUIRES_RESYNC, op_name, tuple(tokens), subquery)
+            if first_token == 'primary':
+                return AlterOperation(AlterOperationCategory.SAFE_NOOP, op_name, tuple(tokens), subquery)
+            ignored_keywords = ('constraint', 'check', 'index', 'foreign', 'unique', 'key')
+            if self._starts_with_keyword(tokens[0], ignored_keywords):
+                return AlterOperation(AlterOperationCategory.SAFE_NOOP, op_name, tuple(tokens), subquery)
+            if len(tokens) == 1:
+                return AlterOperation(AlterOperationCategory.COLUMN_CHANGE, 'drop_column', tuple(tokens), subquery)
+            return AlterOperation(AlterOperationCategory.UNKNOWN, op_name, tuple(tokens), subquery)
+
+        if op_name == 'modify':
+            if not tokens:
+                return AlterOperation(AlterOperationCategory.UNKNOWN, op_name, tuple(tokens), subquery)
+            return AlterOperation(AlterOperationCategory.COLUMN_CHANGE, 'modify_column', tuple(tokens), subquery)
+
+        if op_name == 'change':
+            if not tokens:
+                return AlterOperation(AlterOperationCategory.UNKNOWN, op_name, tuple(tokens), subquery)
+            return AlterOperation(AlterOperationCategory.COLUMN_CHANGE, 'change_column', tuple(tokens), subquery)
+
+        if op_name == 'rename':
+            if not tokens:
+                return AlterOperation(AlterOperationCategory.UNKNOWN, op_name, tuple(tokens), subquery)
+            first_token = tokens[0].lower()
+            if first_token in ('index', 'key'):
+                return AlterOperation(AlterOperationCategory.SAFE_NOOP, op_name, tuple(tokens), subquery)
+            if first_token == 'column':
+                return AlterOperation(AlterOperationCategory.COLUMN_CHANGE, 'rename_column', tuple(tokens[1:]), subquery)
+            return AlterOperation(AlterOperationCategory.REQUIRES_RESYNC, op_name, tuple(tokens), subquery)
+
+        safe_noop_operations = {
+            'algorithm', 'alter', 'auto_increment', 'avg_row_length', 'character',
+            'checksum', 'collate', 'comment', 'compression', 'connection', 'convert',
+            'data', 'default', 'disable', 'discard', 'enable', 'encryption', 'engine',
+            'engine_attribute', 'force', 'import', 'index', 'insert_method',
+            'key_block_size', 'lock', 'max_rows', 'min_rows', 'order', 'pack_keys',
+            'password', 'row_format', 'secondary_engine_attribute', 'stats_auto_recalc',
+            'stats_persistent', 'stats_sample_pages', 'tablespace', 'union', 'with',
+            'without',
+        }
+        if op_name in safe_noop_operations:
+            return AlterOperation(AlterOperationCategory.SAFE_NOOP, op_name, tuple(tokens), subquery)
+
+        partition_operations = {
+            'analyze', 'check', 'coalesce', 'exchange', 'optimize', 'rebuild',
+            'remove', 'reorganize', 'repair', 'truncate',
+        }
+        if op_name in partition_operations:
+            return AlterOperation(AlterOperationCategory.REQUIRES_RESYNC, op_name, tuple(tokens), subquery)
+
+        return AlterOperation(AlterOperationCategory.UNKNOWN, op_name, tuple(tokens), subquery)
+
+    def convert_alter_query(self, mysql_query, db_name):
+        db_name, table_name, matches_config, operations = self.parse_alter_query(mysql_query, db_name)
+
+        if not matches_config:
+            return
+
+        unsupported_operations = [
+            operation for operation in operations
+            if operation.category in (AlterOperationCategory.REQUIRES_RESYNC, AlterOperationCategory.UNKNOWN)
+        ]
+        if unsupported_operations:
+            operation = unsupported_operations[0]
+            raise UnsupportedAlterOperation(
+                f'unsupported ALTER TABLE operation ({operation.category.value}): {operation.clause}; '
+                f'full query: {mysql_query}'
+            )
+
+        self._validate_alter_plan(table_name, operations)
+
+        for operation in operations:
+            if operation.category == AlterOperationCategory.SAFE_NOOP:
                 continue
 
-            if op_name == 'drop':
-                if tokens[0].lower() in ('constraint', 'index', 'foreign', 'unique', 'key'):
-                    continue
-                # Handle cases where keywords are combined with parentheses: INDEX(col), CONSTRAINT(name), etc.
-                for keyword in ('constraint', 'index', 'foreign', 'unique', 'key'):
-                    if tokens[0].lower().startswith(f'{keyword}('):
-                        break
-                else:
-                    self.__convert_alter_table_drop_column(db_name, table_name, tokens)
-                continue
-
-            if op_name == 'modify':
+            tokens = list(operation.tokens)
+            if operation.action == 'add_column':
+                self.__convert_alter_table_add_column(db_name, table_name, tokens)
+            elif operation.action == 'drop_column':
+                self.__convert_alter_table_drop_column(db_name, table_name, tokens)
+            elif operation.action == 'modify_column':
                 self.__convert_alter_table_modify_column(db_name, table_name, tokens)
-                continue
-
-            if op_name == 'alter':
-                continue
-
-            if op_name == 'auto_increment':
-                continue
-
-            if op_name == 'convert':
-                continue
-
-            if op_name == 'change':
+            elif operation.action == 'change_column':
                 self.__convert_alter_table_change_column(db_name, table_name, tokens)
-                continue
-            
-            if op_name == 'rename':
-                # Ignore RENAME INDEX/KEY operations: ClickHouse doesn't mirror MySQL indexes.
-                if tokens[0].lower() in ('index', 'key'):
-                    continue
-
-                # Handle RENAME COLUMN operation
-                if tokens[0].lower() == 'column':
-                    tokens = tokens[1:]  # Skip the COLUMN keyword
+            elif operation.action == 'rename_column':
                 self.__convert_alter_table_rename_column(db_name, table_name, tokens)
-                continue
 
-            raise Exception(f'operation {op_name} not implement, query: {subquery}, full query: {mysql_query}')
+    def _validate_alter_plan(self, table_name, operations):
+        mysql_structure = None
+        ch_structure = None
+        if self.db_replicator:
+            if table_name not in self.db_replicator.state.tables_structure:
+                raise Exception(f'table {table_name} not found in replicator state')
+            mysql_structure, ch_structure = copy.deepcopy(
+                self.db_replicator.state.tables_structure[table_name]
+            )
+
+        for operation in operations:
+            if operation.category == AlterOperationCategory.SAFE_NOOP:
+                continue
+            self._validate_alter_operation(operation, mysql_structure, ch_structure)
+
+    def _validate_alter_operation(self, operation, mysql_structure, ch_structure):
+        tokens = list(operation.tokens)
+
+        if operation.action == 'add_column':
+            column_name, column_type_mysql, _, column_after, column_first, column_type_ch = self._parse_add_column(tokens)
+            if mysql_structure is None:
+                return
+            mysql_exists = mysql_structure.has_field(column_name)
+            ch_exists = ch_structure.has_field(column_name)
+            if mysql_exists != ch_exists:
+                raise Exception(f'inconsistent table structures for column {column_name}')
+            if mysql_exists:
+                return
+            if column_first:
+                mysql_structure.add_field_first(TableField(name=column_name, field_type=column_type_mysql))
+                ch_structure.add_field_first(TableField(name=column_name, field_type=column_type_ch))
+            else:
+                if column_after is None:
+                    column_after = mysql_structure.fields[-1].name
+                mysql_structure.add_field_after(TableField(name=column_name, field_type=column_type_mysql), column_after)
+                ch_structure.add_field_after(TableField(name=column_name, field_type=column_type_ch), column_after)
+            return
+
+        if operation.action == 'drop_column':
+            column_name = self._parse_drop_column(tokens)
+            if mysql_structure is None:
+                return
+            mysql_exists = mysql_structure.has_field(column_name)
+            ch_exists = ch_structure.has_field(column_name)
+            if mysql_exists != ch_exists:
+                raise Exception(f'inconsistent table structures for column {column_name}')
+            if not mysql_exists:
+                return
+            mysql_structure.remove_field(column_name)
+            ch_structure.remove_field(column_name)
+            return
+
+        if operation.action == 'modify_column':
+            column_name, column_type_mysql, _, column_type_ch = self._parse_modify_column(tokens)
+            if mysql_structure is None:
+                return
+            if not mysql_structure.has_field(column_name) or not ch_structure.has_field(column_name):
+                raise Exception(f'field {column_name} not found')
+            mysql_structure.update_field(TableField(name=column_name, field_type=column_type_mysql))
+            ch_structure.update_field(TableField(name=column_name, field_type=column_type_ch))
+            return
+
+        if operation.action == 'change_column':
+            old_name, new_name, column_type_mysql, _, column_type_ch = self._parse_change_column(tokens)
+            if mysql_structure is None:
+                return
+            current_name = self._get_change_column_current_name(mysql_structure, ch_structure, old_name, new_name)
+            mysql_structure.update_field(TableField(name=current_name, field_type=column_type_mysql))
+            ch_structure.update_field(TableField(name=current_name, field_type=column_type_ch))
+            if current_name != new_name:
+                self._rename_structure_field(mysql_structure, current_name, new_name)
+                self._rename_structure_field(ch_structure, current_name, new_name)
+            return
+
+        if operation.action == 'rename_column':
+            old_name, new_name = self._parse_rename_column(tokens)
+            if mysql_structure is None:
+                return
+            current_name = self._get_change_column_current_name(mysql_structure, ch_structure, old_name, new_name)
+            if current_name != new_name:
+                self._rename_structure_field(mysql_structure, current_name, new_name)
+                self._rename_structure_field(ch_structure, current_name, new_name)
+            return
 
     @classmethod
     def _tokenize_alter_query(cls, sql_line):
@@ -848,111 +1026,158 @@ class MysqlToClickhouseConverter:
         else:
             return [column_name] + param_tokens
 
-    def __convert_alter_table_add_column(self, db_name, table_name, tokens):
+    def _parse_add_column(self, tokens):
         tokens = self._tokenize_alter_query(' '.join(tokens))
-
         if len(tokens) < 2:
             raise Exception('wrong tokens count', tokens)
 
         column_after = None
         column_first = False
-        if tokens[-2].lower() == 'after':
+        if len(tokens) >= 2 and tokens[-2].lower() == 'after':
             column_after = strip_sql_name(tokens[-1])
             tokens = tokens[:-2]
-            if len(tokens) < 2:
-                raise Exception('wrong tokens count', tokens)
         elif tokens[-1].lower() == 'first':
             column_first = True
+            tokens = tokens[:-1]
 
-        column_name = strip_sql_name(tokens[0])
-        column_type_mysql = tokens[1]
-        column_type_mysql_parameters = ' '.join(tokens[2:])
-
-        column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
-
-        # update table structure
-        if self.db_replicator:
-            table_structure = self.db_replicator.state.tables_structure[table_name]
-            mysql_table_structure: TableStructure = table_structure[0]
-            ch_table_structure: TableStructure = table_structure[1]
-
-            if column_first:
-                mysql_table_structure.add_field_first(
-                    TableField(name=column_name, field_type=column_type_mysql)
-                )
-                
-                ch_table_structure.add_field_first(
-                    TableField(name=column_name, field_type=column_type_ch)
-                )
-            else:
-                if column_after is None:
-                    column_after = strip_sql_name(mysql_table_structure.fields[-1].name)
-
-                mysql_table_structure.add_field_after(
-                    TableField(name=column_name, field_type=column_type_mysql),
-                    column_after,
-                )
-
-                ch_table_structure.add_field_after(
-                    TableField(name=column_name, field_type=column_type_ch),
-                    column_after,
-                )
-
-        target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
-        on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} ADD COLUMN `{column_name}` {column_type_ch}'
-        if column_first:
-            query += ' FIRST'
-        else:
-            query += f' AFTER {column_after}'
-
-        if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
-
-    def __convert_alter_table_drop_column(self, db_name, table_name, tokens):
-        if len(tokens) != 1:
-            raise Exception('wrong tokens count', tokens)
-
-        column_name = strip_sql_name(tokens[0])
-
-        # update table structure
-        if self.db_replicator:
-            table_structure = self.db_replicator.state.tables_structure[table_name]
-            mysql_table_structure: TableStructure = table_structure[0]
-            ch_table_structure: TableStructure = table_structure[1]
-
-            mysql_table_structure.remove_field(field_name=column_name)
-            ch_table_structure.remove_field(field_name=column_name)
-
-        target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
-        on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} DROP COLUMN {column_name}'
-        if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
-
-    def __convert_alter_table_modify_column(self, db_name, table_name, tokens):
         if len(tokens) < 2:
             raise Exception('wrong tokens count', tokens)
 
         column_name = strip_sql_name(tokens[0])
         column_type_mysql = tokens[1]
         column_type_mysql_parameters = ' '.join(tokens[2:])
-
         column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
+        return (
+            column_name, column_type_mysql, column_type_mysql_parameters,
+            column_after, column_first, column_type_ch,
+        )
 
-        # update table structure
+    @staticmethod
+    def _parse_drop_column(tokens):
+        if len(tokens) != 1:
+            raise Exception('wrong tokens count', tokens)
+        return strip_sql_name(tokens[0])
+
+    def _parse_modify_column(self, tokens):
+        tokens = self._tokenize_alter_query(' '.join(tokens))
+        if len(tokens) < 2:
+            raise Exception('wrong tokens count', tokens)
+        column_name = strip_sql_name(tokens[0])
+        column_type_mysql = tokens[1]
+        column_type_mysql_parameters = ' '.join(tokens[2:])
+        column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
+        return column_name, column_type_mysql, column_type_mysql_parameters, column_type_ch
+
+    def _parse_change_column(self, tokens):
+        if len(tokens) < 3:
+            raise Exception('wrong tokens count', tokens)
+        old_column_name = strip_sql_name(tokens[0])
+        new_column_name = strip_sql_name(tokens[1])
+        column_tokens = self._tokenize_alter_query(' '.join([tokens[1]] + tokens[2:]))
+        if len(column_tokens) < 2:
+            raise Exception('wrong tokens count', tokens)
+        column_type_mysql = column_tokens[1]
+        column_type_mysql_parameters = ' '.join(column_tokens[2:])
+        column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
+        return (
+            old_column_name, new_column_name, column_type_mysql,
+            column_type_mysql_parameters, column_type_ch,
+        )
+
+    @staticmethod
+    def _parse_rename_column(tokens):
+        if len(tokens) != 3:
+            raise Exception('wrong tokens count for RENAME COLUMN', tokens)
+        if tokens[1].lower() != 'to':
+            raise Exception('expected TO keyword in RENAME COLUMN syntax', tokens)
+        return strip_sql_name(tokens[0]), strip_sql_name(tokens[2])
+
+    @staticmethod
+    def _rename_structure_field(structure, old_name, new_name):
+        field = structure.get_field(old_name)
+        if field is None:
+            raise Exception(f'Column {old_name} not found in structure')
+        field.name = new_name
+        structure.primary_keys = [new_name if key == old_name else key for key in structure.primary_keys]
+        structure.preprocess()
+
+    @staticmethod
+    def _get_change_column_current_name(mysql_structure, ch_structure, old_name, new_name):
+        mysql_old = mysql_structure.has_field(old_name)
+        ch_old = ch_structure.has_field(old_name)
+        mysql_new = mysql_structure.has_field(new_name)
+        ch_new = ch_structure.has_field(new_name)
+
+        if mysql_old and ch_old and (old_name == new_name or not mysql_new and not ch_new):
+            return old_name
+        if old_name != new_name and mysql_new and ch_new and not mysql_old and not ch_old:
+            return new_name
+        raise Exception(f'inconsistent table structures for column rename {old_name} to {new_name}')
+
+    def __convert_alter_table_add_column(self, db_name, table_name, tokens):
+        (
+            column_name, column_type_mysql, _, column_after,
+            column_first, column_type_ch,
+        ) = self._parse_add_column(tokens)
+
+        mysql_table_structure = None
+        ch_table_structure = None
         if self.db_replicator:
             table_structure = self.db_replicator.state.tables_structure[table_name]
-            mysql_table_structure: TableStructure = table_structure[0]
-            ch_table_structure: TableStructure = table_structure[1]
+            mysql_table_structure, ch_table_structure = table_structure
+            if mysql_table_structure.has_field(column_name) and ch_table_structure.has_field(column_name):
+                return
+            if column_after is None and not column_first:
+                column_after = strip_sql_name(mysql_table_structure.fields[-1].name)
 
-            mysql_table_structure.update_field(
-                TableField(name=column_name, field_type=column_type_mysql),
-            )
+        target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
+        on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
+        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} ADD COLUMN IF NOT EXISTS `{column_name}` {column_type_ch}'
+        if column_first:
+            query += ' FIRST'
+        elif column_after is not None:
+            query += f' AFTER {column_after}'
 
-            ch_table_structure.update_field(
-                TableField(name=column_name, field_type=column_type_ch),
-            )
+        if self.db_replicator:
+            self.db_replicator.clickhouse_api.execute_command(query)
+            if column_first:
+                mysql_table_structure.add_field_first(TableField(name=column_name, field_type=column_type_mysql))
+                ch_table_structure.add_field_first(TableField(name=column_name, field_type=column_type_ch))
+            else:
+                mysql_table_structure.add_field_after(
+                    TableField(name=column_name, field_type=column_type_mysql), column_after,
+                )
+                ch_table_structure.add_field_after(
+                    TableField(name=column_name, field_type=column_type_ch), column_after,
+                )
+
+    def __convert_alter_table_drop_column(self, db_name, table_name, tokens):
+        column_name = self._parse_drop_column(tokens)
+
+        mysql_table_structure = None
+        ch_table_structure = None
+        if self.db_replicator:
+            table_structure = self.db_replicator.state.tables_structure[table_name]
+            mysql_table_structure, ch_table_structure = table_structure
+            if not mysql_table_structure.has_field(column_name) and not ch_table_structure.has_field(column_name):
+                return
+
+        target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
+        on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
+        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} DROP COLUMN IF EXISTS `{column_name}`'
+        if self.db_replicator:
+            self.db_replicator.clickhouse_api.execute_command(query)
+            mysql_table_structure.remove_field(field_name=column_name)
+            ch_table_structure.remove_field(field_name=column_name)
+
+    def __convert_alter_table_modify_column(self, db_name, table_name, tokens):
+        column_name, column_type_mysql, column_type_mysql_parameters, column_type_ch = self._parse_modify_column(tokens)
+
+        mysql_table_structure = None
+        ch_table_structure = None
+        if self.db_replicator:
+            table_structure = self.db_replicator.state.tables_structure[table_name]
+            mysql_table_structure, ch_table_structure = table_structure
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
@@ -973,9 +1198,11 @@ class MysqlToClickhouseConverter:
                     inner_type = field_type
                 default_clause = f' DEFAULT {self.__get_default_value_for_type(inner_type)}'
         
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} MODIFY COLUMN `{column_name}` {column_type_ch}{default_clause}'
+        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} MODIFY COLUMN IF EXISTS `{column_name}` {column_type_ch}{default_clause}'
         if self.db_replicator:
             self.db_replicator.clickhouse_api.execute_command(query)
+            mysql_table_structure.update_field(TableField(name=column_name, field_type=column_type_mysql))
+            ch_table_structure.update_field(TableField(name=column_name, field_type=column_type_ch))
 
     def __get_default_value_for_type(self, ch_type: str) -> str:
         """Get appropriate default value for ClickHouse type when converting from nullable to non-nullable"""
@@ -1096,97 +1323,65 @@ class MysqlToClickhouseConverter:
         return ''
 
     def __convert_alter_table_change_column(self, db_name, table_name, tokens):
-        if len(tokens) < 3:
-            raise Exception('wrong tokens count', tokens)
+        (
+            column_name, new_column_name, column_type_mysql,
+            column_type_mysql_parameters, column_type_ch,
+        ) = self._parse_change_column(tokens)
 
-        column_name = strip_sql_name(tokens[0])
-        new_column_name = strip_sql_name(tokens[1])
-        column_type_mysql = tokens[2]
-        column_type_mysql_parameters = ' '.join(tokens[3:])
-
-        column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
-
-        # update table structure
         if self.db_replicator:
             table_structure = self.db_replicator.state.tables_structure[table_name]
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
+            current_name = self._get_change_column_current_name(
+                mysql_table_structure, ch_table_structure, column_name, new_column_name,
+            )
 
-            current_column_type_ch = ch_table_structure.get_field(column_name).field_type
+            current_column_type_ch = ch_table_structure.get_field(current_name).field_type
             target_table_name = self.db_replicator.get_target_table_name(table_name)
             on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause()
 
             if current_column_type_ch != column_type_ch:
-
+                query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} MODIFY COLUMN IF EXISTS `{current_name}` {column_type_ch}'
+                self.db_replicator.clickhouse_api.execute_command(query)
                 mysql_table_structure.update_field(
-                    TableField(name=column_name, field_type=column_type_mysql),
+                    TableField(name=current_name, field_type=column_type_mysql),
                 )
-
                 ch_table_structure.update_field(
-                    TableField(name=column_name, field_type=column_type_ch),
+                    TableField(name=current_name, field_type=column_type_ch),
                 )
 
-                query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} MODIFY COLUMN {column_name} {column_type_ch}'
+            if current_name != new_column_name:
+                query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} RENAME COLUMN IF EXISTS `{current_name}` TO `{new_column_name}`'
                 self.db_replicator.clickhouse_api.execute_command(query)
-
-            if column_name != new_column_name:
-                curr_field_mysql = mysql_table_structure.get_field(column_name)
-                curr_field_clickhouse = ch_table_structure.get_field(column_name)
-
-                curr_field_mysql.name = new_column_name
-                curr_field_clickhouse.name = new_column_name
-
-                query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} RENAME COLUMN {column_name} TO {new_column_name}'
-                self.db_replicator.clickhouse_api.execute_command(query)
+                self._rename_structure_field(mysql_table_structure, current_name, new_column_name)
+                self._rename_structure_field(ch_table_structure, current_name, new_column_name)
 
     def __convert_alter_table_rename_column(self, db_name, table_name, tokens):
         """
         Handle the RENAME COLUMN syntax of ALTER TABLE statements.
         Example: RENAME COLUMN old_name TO new_name
         """
-        if len(tokens) < 3:
-            raise Exception('wrong tokens count for RENAME COLUMN', tokens)
+        old_column_name, new_column_name = self._parse_rename_column(tokens)
+        current_name = old_column_name
         
-        # Extract old and new column names
-        old_column_name = strip_sql_name(tokens[0])
-        
-        # Check if the second token is "TO" (standard syntax)
-        if tokens[1].lower() != 'to':
-            raise Exception('expected TO keyword in RENAME COLUMN syntax', tokens)
-        
-        new_column_name = strip_sql_name(tokens[2])
-        
-        # Update table structure
         if self.db_replicator:
             if table_name in self.db_replicator.state.tables_structure:
                 table_structure = self.db_replicator.state.tables_structure[table_name]
                 mysql_table_structure: TableStructure = table_structure[0]
                 ch_table_structure: TableStructure = table_structure[1]
-                
-                # Update field name in MySQL structure
-                mysql_field = mysql_table_structure.get_field(old_column_name)
-                if mysql_field:
-                    mysql_field.name = new_column_name
-                else:
-                    raise Exception(f'Column {old_column_name} not found in MySQL structure')
-                
-                # Update field name in ClickHouse structure
-                ch_field = ch_table_structure.get_field(old_column_name)
-                if ch_field:
-                    ch_field.name = new_column_name
-                else:
-                    raise Exception(f'Column {old_column_name} not found in ClickHouse structure')
-                
-                # Preprocess to update primary key IDs if the renamed column is part of the primary key
-                mysql_table_structure.preprocess()
-                ch_table_structure.preprocess()
-            
-        # Execute the RENAME COLUMN command in ClickHouse
+                current_name = self._get_change_column_current_name(
+                    mysql_table_structure, ch_table_structure, old_column_name, new_column_name,
+                )
+                if current_name == new_column_name:
+                    return
+
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} RENAME COLUMN `{old_column_name}` TO `{new_column_name}`'
+        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} RENAME COLUMN IF EXISTS `{current_name}` TO `{new_column_name}`'
         if self.db_replicator:
             self.db_replicator.clickhouse_api.execute_command(query)
+            self._rename_structure_field(mysql_table_structure, current_name, new_column_name)
+            self._rename_structure_field(ch_table_structure, current_name, new_column_name)
 
     def _handle_create_table_like(self, create_statement, source_table_name, target_table_name, is_query_api=True):
         """
